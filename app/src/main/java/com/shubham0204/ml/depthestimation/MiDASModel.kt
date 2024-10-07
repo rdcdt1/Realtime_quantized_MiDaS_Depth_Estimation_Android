@@ -31,85 +31,77 @@ import org.tensorflow.lite.support.image.TensorImage
 import org.tensorflow.lite.support.image.ops.ResizeOp
 import org.tensorflow.lite.support.tensorbuffer.TensorBuffer
 import org.tensorflow.lite.support.tensorbuffer.TensorBufferFloat
+import org.tensorflow.lite.support.common.ops.CastOp
+import org.tensorflow.lite.support.tensorbuffer.TensorBufferUint8
+import java.nio.ByteBuffer
 
 // Helper class for the MiDAS TFlite model
 class MiDASModel( context: Context ) {
 
     // See the `app/src/main/assets` folder for the TFLite model
-    private val modelFileName = "depth_model.tflite"
+    private val modelFileName = "quantized_depth_model.tflite"
     private var interpreter : Interpreter
     private val NUM_THREADS = 4
 
     // These values are taken from the Python file ->
     // https://github.com/isl-org/MiDaS/blob/master/mobile/android/models/src/main/assets/run_tflite.py
     private val inputImageDim = 256
-    private val mean = floatArrayOf( 123.675f ,  116.28f ,  103.53f )
-    private val std = floatArrayOf( 58.395f , 57.12f ,  57.375f )
 
-    // Input tensor processor for MiDAS
-    // 1. Resize the image to ( 256 , 256 )
-    // 2. Normalize using the given mean and std for each channel.
+    // Modified input tensor processor for quantized model
     private val inputTensorProcessor = ImageProcessor.Builder()
-        .add( ResizeOp( inputImageDim , inputImageDim , ResizeOp.ResizeMethod.BILINEAR ) )
-        .add( NormalizeOp( mean , std ) )
+        .add(ResizeOp(inputImageDim, inputImageDim, ResizeOp.ResizeMethod.BILINEAR))
+        .add(CastOp(DataType.UINT8))
         .build()
-
-    // Output tensor processor for MiDAS
-    // Perform min-max scaling for the outputs. See `MinMaxScalingOp` class.
-    private val outputTensorProcessor = TensorProcessor.Builder()
-        .add( MinMaxScalingOp() )
-        .build()
-
-
 
     init {
-        // Initialize TFLite Interpreter
         val interpreterOptions = Interpreter.Options().apply {
-            // Add the GPU Delegate if supported.
-            // See -> https://www.tensorflow.org/lite/performance/gpu#android
-            if ( CompatibilityList().isDelegateSupportedOnThisDevice ) {
-                Logger.logInfo( "GPU Delegate is supported on this device." )
-                addDelegate( GpuDelegate( CompatibilityList().bestOptionsForThisDevice ))
-            }
-            else {
-                // Number of threads for computation
-                setNumThreads( NUM_THREADS )
+            if (CompatibilityList().isDelegateSupportedOnThisDevice) {
+                Logger.logInfo("GPU Delegate is supported on this device.")
+                addDelegate(GpuDelegate(CompatibilityList().bestOptionsForThisDevice))
+            } else {
+                setNumThreads(NUM_THREADS)
             }
         }
-        interpreter = Interpreter(FileUtil.loadMappedFile( context, modelFileName ) , interpreterOptions )
-        Logger.logInfo( "TFLite interpreter created." )
+        interpreter = Interpreter(FileUtil.loadMappedFile(context, modelFileName), interpreterOptions)
+        Logger.logInfo("TFLite interpreter created.")
     }
 
 
-    fun getDepthMap( inputImage : Bitmap ) : Bitmap {
-        return run( inputImage )
+
+    fun getDepthMap(inputImage: Bitmap): Bitmap {
+        return run(inputImage)
     }
 
-
-    private fun run( inputImage : Bitmap ): Bitmap {
-        // Note: The model takes in a RGB image ( of shape ( 256 , 256 , 3 ) ) and
-        // outputs a depth map of shape ( 256 , 256 , 1 )
-        // Create a tensor of shape ( 1 , inputImageDim , inputImageDim , 3 ) from the given Bitmap.
-        // Then perform operations on the tensor as described by `inputTensorProcessor`.
-        var inputTensor = TensorImage.fromBitmap( inputImage )
+    private fun run(inputImage: Bitmap): Bitmap {
+        var inputTensor = TensorImage.fromBitmap(inputImage)
 
         val t1 = System.currentTimeMillis()
-        inputTensor = inputTensorProcessor.process( inputTensor )
+        inputTensor = inputTensorProcessor.process(inputTensor)
 
-        // Output tensor of shape ( 256 , 256 , 1 ) and data type float32
-        var outputTensor = TensorBufferFloat.createFixedSize(
-            intArrayOf( inputImageDim , inputImageDim , 1 ) , DataType.FLOAT32 )
+        Logger.logInfo("Input tensor shape: ${inputTensor.tensorBuffer.shape.contentToString()}")
+        Logger.logInfo("Input tensor buffer size: ${inputTensor.tensorBuffer.buffer.capacity()} bytes")
 
-        // Perform inference on the MiDAS model
-        interpreter.run( inputTensor.buffer, outputTensor.buffer )
+        val outputTensor = TensorBufferUint8.createFixedSize(
+            intArrayOf(inputImageDim, inputImageDim, 1), DataType.UINT8)
 
-        // Perform operations on the output tensor as described by `outputTensorProcessor`.
-        outputTensor = outputTensorProcessor.process( outputTensor )
+        Logger.logInfo("Output tensor shape: ${outputTensor.shape.contentToString()}")
+        Logger.logInfo("Output tensor buffer size: ${outputTensor.buffer.capacity()} bytes")
 
-        Logger.logInfo( "MiDaS inference speed: ${System.currentTimeMillis() - t1}")
+        try {
+            Logger.logInfo("Starting interpreter.run")
+            interpreter.run(inputTensor.buffer, outputTensor.buffer)
+            Logger.logInfo("Finished interpreter.run")
+        } catch (e: IllegalArgumentException) {
+            Logger.logError("Interpreter run failed: ${e.message}")
+            e.printStackTrace()
+            return Bitmap.createBitmap(inputImageDim, inputImageDim, Bitmap.Config.ARGB_8888)
+        }
 
-        // Create a Bitmap from the depth map which will be displayed on the screen.
-        return BitmapUtils.byteBufferToBitmap( outputTensor.floatArray , inputImageDim )
+        Logger.logInfo("MiDaS inference speed: ${System.currentTimeMillis() - t1}")
+
+        // Convert UINT8 to float for bitmap creation
+        val floatArray = outputTensor.intArray.map { it.toFloat() }.toFloatArray()
+        return BitmapUtils.byteBufferToBitmap(floatArray, inputImageDim)
     }
 
 
